@@ -1,7 +1,11 @@
 #[deny(unused_imports)]
 #[deny(missing_docs)]
-use std::thread;
-use std::time::{Duration, SystemTime};
+use influxdb_client::{Client, Point, Precision, TimestampOptions};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::runtime::{self, Runtime};
 use xplm::{
     debug,
     flight_loop::{FlightLoop, FlightLoopCallback},
@@ -25,27 +29,50 @@ struct DataMonitorPlugin {
 struct LoopHandler {
     location: Location,
     energy: Energy,
-    last_run: SystemTime,
+    last_run: Instant,
+    start_time: SystemTime,
+    leg_started: bool,
+    influx: Arc<influxdb_client::Client>,
+    rt: Arc<Runtime>,
 }
 
 impl FlightLoopCallback for LoopHandler {
     fn flight_loop(&mut self, state: &mut xplm::flight_loop::LoopState) {
-        if self.last_run.elapsed().unwrap() >= Duration::from_secs(5) {
-            let battery_on = self.energy.battery_on();
-            let gpu_on = self.energy.gpu_on();
-            let location = self.location.to_string();
-            let energy = self.energy.to_string();
-            let thread = thread::spawn(move || {
-                // Do stuff with location
-                if battery_on || gpu_on {
-                    debug(format!("[DATAMONITOR] {}\n", location));
-                    debug(format!("[DATAMONITOR] {}\n", energy));
-                }
+        let battery_on = self.energy.battery_on();
+        let gpu_on = self.energy.gpu_on();
+        let apu_on = self.energy.apu_on();
+        if (battery_on || gpu_on || apu_on) && !self.leg_started {
+            // TODO reset on FP change
+            self.leg_started = true;
+        }
+        if self.last_run.elapsed() >= Duration::from_secs(1) && self.leg_started {
+            let latitude = self.location.lat();
+            let longitude = self.location.lon();
+            let altitude = self.location.alt();
+            let timestamp = self
+                .start_time
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs() as i64;
+
+            let client = self.influx.clone();
+            self.rt.spawn(async move {
+                let location_point = Point::new("location")
+                    .tag("start_time", timestamp)
+                    .field("latitude", latitude)
+                    .field("longitude", longitude)
+                    .field("altitude_feet", altitude);
+                let status_point = Point::new("status")
+                    .tag("start_time", timestamp)
+                    .field("battery_on", battery_on)
+                    .field("gpu_on", gpu_on)
+                    .field("apu_on", apu_on);
+                let points = vec![&location_point, &status_point];
+                if let Err(e) = client.insert_points(points, TimestampOptions::None).await {
+                    debug(format!("[DATAMONITOR][ERROR] Sending Points: {:#?}\n", e));
+                };
             });
-            if let Err(e) = thread.join() {
-                debug(format!("[DATAMONITOR][ERROR] {:?}\n", e));
-            }
-            self.last_run = SystemTime::now();
+            self.last_run = Instant::now();
         }
         state.call_next_loop()
     }
@@ -74,10 +101,25 @@ impl Plugin for DataMonitorPlugin {
             debug(format!("[DATAMONITOR][ERROR] Energy init: {:?}\n", e));
         }
 
+        let influx_client = Client::new("http://10.0.0.1:8086", 
+        "wuL5_5sg_zlaQdkDWhmiFZ9r-Fx1rWgNR407czXOeQmYU1PHlp0nwpmjjW270PzEgEctx0AqD_K7K-h9Ein6Pg==")
+        .with_org("Nordgedanken")
+    .with_bucket("flightdata")
+    .with_precision(Precision::MS);
+
+        let rt = runtime::Runtime::new();
+        if let Err(ref e) = rt {
+            debug(format!("[DATAMONITOR][ERROR] Creating runtime: {:#?}\n", e));
+        }
+
         let loophandler = LoopHandler {
             location: location.unwrap(),
             energy: energy.unwrap(),
-            last_run: SystemTime::now(),
+            last_run: Instant::now(),
+            influx: Arc::new(influx_client),
+            start_time: SystemTime::now(),
+            leg_started: false,
+            rt: Arc::new(rt.unwrap()),
         };
         let plugin = DataMonitorPlugin {
             loophandler,
