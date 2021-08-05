@@ -4,6 +4,4 @@ use thiserror::Error as ThisError;
 pub(crate) enum Error {
     #[error(transparent)]
     FindError(#[from] xplm::data::borrowed::FindError),
-    #[error("Unable to get lock")]
-    UnableToGetLock,
 }

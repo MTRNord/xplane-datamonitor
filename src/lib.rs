@@ -1,16 +1,10 @@
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, RwLock,
-    },
-    thread::JoinHandle,
-};
 #[deny(unused_imports)]
 #[deny(missing_docs)]
-use std::{thread, time};
-use tokio::runtime::Runtime;
+use std::thread;
+use std::time::{Duration, SystemTime};
 use xplm::{
     debug,
+    flight_loop::{FlightLoop, FlightLoopCallback},
     plugin::{Plugin, PluginInfo},
     xplane_plugin,
 };
@@ -22,44 +16,48 @@ mod energy;
 mod error;
 mod location;
 
-#[derive(Clone)]
 struct DataMonitorPlugin {
+    loophandler: LoopHandler,
+    flightloop: Option<FlightLoop>,
+}
+
+#[derive(Clone)]
+struct LoopHandler {
     location: Location,
     energy: Energy,
-    thread: Arc<RwLock<Option<JoinHandle<()>>>>,
-    stopped: Arc<AtomicBool>,
+    last_run: SystemTime,
+}
+
+impl FlightLoopCallback for LoopHandler {
+    fn flight_loop(&mut self, state: &mut xplm::flight_loop::LoopState) {
+        if self.last_run.elapsed().unwrap() >= Duration::from_secs(5) {
+            let battery_on = self.energy.battery_on();
+            let gpu_on = self.energy.gpu_on();
+            let location = self.location.to_string();
+            let energy = self.energy.to_string();
+            let thread = thread::spawn(move || {
+                // Do stuff with location
+                if battery_on || gpu_on {
+                    debug(format!("[DATAMONITOR] {}\n", location));
+                    debug(format!("[DATAMONITOR] {}\n", energy));
+                }
+            });
+            if let Err(e) = thread.join() {
+                debug(format!("[DATAMONITOR][ERROR] {:?}\n", e));
+            }
+            self.last_run = SystemTime::now();
+        }
+        state.call_next_loop()
+    }
 }
 
 impl DataMonitorPlugin {
-    pub(crate) fn start(&self) {
+    pub(crate) fn start(&mut self) {
         debug("[DATAMONITOR] starting\n");
-        let self_clone = self.clone();
-        let thread = thread::spawn(move || {
-            let delay = time::Duration::from_secs(5);
-            {
-                debug(format!("[DATAMONITOR] {}\n", self_clone.location));
-            };
-            let rt = Runtime::new().unwrap();
-            loop {
-                // Do stuff
-                if self_clone.stopped.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let current_location = self_clone.location.clone();
-                let current_energy = self_clone.energy.clone();
-                rt.spawn(async move {
-                    // Do stuff with location
-                    if current_energy.battery_on().unwrap() || current_energy.gpu_on().unwrap() {
-                        debug(format!("[DATAMONITOR] {}\n", current_location));
-                        debug(format!("[DATAMONITOR] {}\n", current_energy));
-                    }
-                });
-                thread::sleep(delay);
-            }
-        });
-        let mut lock = self.thread.write().unwrap();
-        *lock = Some(thread);
+        let mut flight_loop = FlightLoop::new(self.loophandler.clone());
+        flight_loop.schedule_immediate();
+        self.flightloop = Some(flight_loop);
+        debug("[DATAMONITOR] started\n");
     }
 }
 
@@ -75,11 +73,15 @@ impl Plugin for DataMonitorPlugin {
         if let Err(ref e) = energy {
             debug(format!("[DATAMONITOR][ERROR] Energy init: {:?}\n", e));
         }
-        let plugin = DataMonitorPlugin {
+
+        let loophandler = LoopHandler {
             location: location.unwrap(),
             energy: energy.unwrap(),
-            thread: Arc::new(RwLock::new(None)),
-            stopped: Arc::new(AtomicBool::new(false)),
+            last_run: SystemTime::now(),
+        };
+        let plugin = DataMonitorPlugin {
+            loophandler,
+            flightloop: None,
         };
         Ok(plugin)
     }
@@ -89,13 +91,6 @@ impl Plugin for DataMonitorPlugin {
     }
     fn disable(&mut self) {
         debug("[DATAMONITOR][INFO] Stopping threads\n");
-        self.stopped.swap(true, Ordering::Release);
-        let mut lock = self.thread.write().unwrap();
-        let thread = std::mem::replace(&mut *lock, None);
-        if let Some(thread) = thread {
-            thread.join().unwrap();
-            debug("[DATAMONITOR][INFO] Stopped threads\n");
-        }
     }
 
     fn info(&self) -> xplm::plugin::PluginInfo {
